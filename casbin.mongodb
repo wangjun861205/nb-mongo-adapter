@@ -1,0 +1,37 @@
+use casbin;
+
+
+db.policy.count({});
+
+db.policy.find({});
+
+{ "ping": 1 };
+
+
+db.policy.dropIndex("digest_1");
+
+db.policy.getIndexes();
+
+db.policy.find({
+	"rule": { $in: [ ["d", "e", "f"], ["a", "b", "c"] ]}
+});
+
+db.policy.deleteMany({});
+
+db.policy.createIndex({"digest": 1}, {unique: true});
+
+
+
+db.policy.insertMany([
+	{
+	"sec": "p",
+	"ptype": "p",
+	"rule": ["user", "resource1", "read", "allow"]
+	},
+	{
+	"sec": "p",
+	"ptype": "p",
+	"rule": ["user", "resource1", "write", "deny"]
+	}
+])
+
