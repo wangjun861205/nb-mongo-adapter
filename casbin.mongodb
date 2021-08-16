@@ -5,7 +5,13 @@ db.policy.count({});
 
 db.policy.find({});
 
-{ "ping": 1 };
+{ ping: 1 };
+
+db.ping();
+
+{
+	"getIndexes": { "collection": "policy" },
+}
 
 
 db.policy.dropIndex("digest_1");

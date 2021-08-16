@@ -2,13 +2,12 @@ use async_trait::async_trait;
 use casbin::{error::AdapterError, Adapter, Filter, Model, Result};
 use futures::{future::ready, TryStreamExt};
 use mongodb::bson::Document;
-use mongodb::{bson::doc, error::Error, Client, Collection, Cursor};
+use mongodb::{bson::doc, error::Error, Client, Collection};
 use serde::{Deserialize, Serialize};
 use std::hash::Hash;
-use std::sync::{Arc, Mutex};
 use std::{collections::hash_map::DefaultHasher, hash::Hasher};
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Policy {
     sec: String,
     ptype: String,
@@ -17,22 +16,30 @@ pub struct Policy {
 }
 
 impl Policy {
-    pub fn new(sec: impl Into<String>, ptype: impl Into<String>, rule: Vec<String>) -> Self {
+    pub fn new<I, T, S, P>(sec: S, ptype: P, rule: I) -> Self
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<String>,
+        S: Into<String>,
+        P: Into<String>,
+    {
         let mut hasher = DefaultHasher::new();
         let s = sec.into();
         let p = ptype.into();
+        let r: Vec<String> = rule.into_iter().map(|v| v.into()).collect();
         s.clone().hash(&mut hasher);
         p.clone().hash(&mut hasher);
-        rule.clone().hash(&mut hasher);
+        r.clone().hash(&mut hasher);
         Self {
             sec: s,
             ptype: p,
-            rule,
+            rule: r,
             digest: format!("{:x}", hasher.finish()),
         }
     }
 }
 
+#[derive(Debug, Clone)]
 struct NBAdapter {
     coll: Collection<Policy>,
     is_filtered: bool,
@@ -51,13 +58,23 @@ impl NBAdapter {
                           "key": {
                             "digest": 1
                           },
+                          "unique": true,
                           "name": "digest_1",
                       },
                   ],
                 },
                 None,
             )
-            .await?;
+            .await
+            .or_else(|e| {
+                let Error { kind, .. } = e.clone();
+                if let mongodb::error::ErrorKind::Command(mongodb::error::CommandError { code, .. }) = kind.as_ref() {
+                    if code == &86 {
+                        return Ok(doc! {});
+                    }
+                };
+                Err(e)
+            })?;
         Ok(Self {
             coll: database.collection("policy"),
             is_filtered: false,
@@ -81,17 +98,14 @@ impl Adapter for NBAdapter {
         Ok(())
     }
     async fn load_filtered_policy<'a>(&mut self, m: &mut dyn Model, f: Filter<'a>) -> Result<()> {
+        let mut p_cond = doc! { "sec": "p" };
+        f.p.iter().enumerate().for_each(|(i, &s)| {
+            if s != "" {
+                p_cond.insert(format!("rule.{}", i), s);
+            }
+        });
         self.coll
-            .find(
-                doc! { "sec": "p", "rule": f.p.iter().filter_map(|v| {
-                    if v == &"" {
-                        None
-                    } else {
-                        Some(v.to_owned())
-                    }
-                }).collect::<Vec<&str>>()},
-                None,
-            )
+            .find(p_cond, None)
             .await
             .map_err(|e| AdapterError(Box::new(e)))?
             .map_err(|e| AdapterError(Box::new(e)))
@@ -100,17 +114,14 @@ impl Adapter for NBAdapter {
                 ready(Ok(()))
             })
             .await?;
+        let mut g_cond = doc! { "sec": "g" };
+        f.p.iter().enumerate().for_each(|(i, &s)| {
+            if s != "" {
+                g_cond.insert(format!("rule.{}", i), s);
+            }
+        });
         self.coll
-            .find(
-                doc! {"sec": "g", "rule": f.g.iter().filter_map(|v| {
-                    if v == &"" {
-                        None
-                    } else {
-                        Some(v.to_owned())
-                    }
-                }).collect::<Vec<&str>>()},
-                None,
-            )
+            .find(g_cond, None)
             .await
             .map_err(|e| AdapterError(Box::new(e)))?
             .map_err(|e| AdapterError(Box::new(e)))
@@ -174,7 +185,7 @@ impl Adapter for NBAdapter {
     }
     async fn remove_policies(&mut self, sec: &str, ptype: &str, rules: Vec<Vec<String>>) -> Result<bool> {
         for rule in rules {
-            let q: Vec<Document> = rule
+            let mut q: Vec<Document> = rule
                 .into_iter()
                 .enumerate()
                 .filter_map(|(i, v)| {
@@ -184,6 +195,8 @@ impl Adapter for NBAdapter {
                     None
                 })
                 .collect();
+            q.push(doc! { "sec": sec });
+            q.push(doc! { "ptype": ptype});
             self.coll.delete_many(doc! { "$and": q}, None).await.map_err(|e| AdapterError(Box::new(e)))?;
         }
         Ok(true)
@@ -201,28 +214,45 @@ impl Adapter for NBAdapter {
 mod test {
     use super::*;
     use casbin::prelude::*;
-    use mongodb::options::{CollectionOptions, SelectionCriteria};
+
+    const URI: &str = "mongodb://localhost:27017";
+    const DB: &str = "casbin";
+    const COLL: &str = "policy";
 
     #[tokio::test]
-    async fn test() {
-        let adapter = NBAdapter::new("mongodb://localhost:27017", "casbin").await.unwrap();
-        let mut e = casbin::Enforcer::new("model.conf", adapter).await.unwrap();
-        println!("{}", e.enforce(("a", "b", "c")).unwrap());
-        println!("{}", e.enforce(("d", "e", "f")).unwrap());
-        println!("{}", e.enforce(("g", "h", "i")).unwrap());
-        e.remove_policy(vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]).await.unwrap();
-        println!("{}", e.enforce(("a", "b", "c")).unwrap());
-        // e.remove_filtered_policy(0, vec!["d".to_owned(), "e".to_owned(), "f".to_owned()]).await.unwrap();
-        // println!("{}", e.enforce(("d", "e", "f")).unwrap());
-        e.save_policy().await.unwrap();
+    async fn new_adapter() {
+        let adapter = NBAdapter::new(URI, DB).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn clear_policy() {
+        let mut adapter = NBAdapter::new(URI, DB).await.unwrap();
+        assert!(adapter.clear_policy().await.is_ok());
+        let client = Client::with_uri_str(URI).await.unwrap();
+        assert_eq!(client.database(DB).collection::<Document>(COLL).count_documents(doc! {}, None).await.unwrap(), 0);
     }
 
     #[tokio::test]
     async fn add_policy() {
-        let adapter = NBAdapter::new("mongodb://localhost:27017", "casbin").await.unwrap();
-        let mut e = casbin::Enforcer::new("model.conf", adapter).await.unwrap();
-        e.clear_policy().await.unwrap();
-        e.add_policy(vec!["a", "b", "c"].into_iter().map(str::to_owned).collect()).await.unwrap();
+        let mut adapter = NBAdapter::new(URI, DB).await.unwrap();
+        assert!(adapter.clear_policy().await.is_ok());
+        assert!(adapter
+            .add_policy("p", "p", vec!["user1", "resource1", "read", "allow"].into_iter().map(str::to_owned).collect())
+            .await
+            .is_ok());
+        let client = Client::with_uri_str(URI).await.unwrap();
+        let p = client
+            .database(DB)
+            .collection::<Policy>(COLL)
+            .find_one(doc! {"sec": "p", "ptype": "p", "rule": vec!["user1", "resource1", "read", "allow"]}, None)
+            .await
+            .unwrap();
+        assert_eq!(p, Some(Policy::new("p", "p", vec!["user1", "resource1", "read", "allow"])));
+    }
+
+    #[tokio::test]
+    async fn add_policies() {
+        let mut adapter = NBAdapter::new(URI, DB).await.unwrap();
     }
 
     #[tokio::test]
@@ -244,47 +274,47 @@ mod test {
     }
 
     #[tokio::test]
-    async fn create_index() {
-        let db = Client::with_uri_str("mongodb://localhost:27017").await.unwrap().database("casbin");
-        db.run_command(
-            doc! {
-              "createIndexes": "policy",
-              "indexes": [
-                  {
-                      "key": {
-                        "digest": 1
-                      },
-                      "name": "digest_1",
-                  },
-              ],
-            },
-            None,
-        )
-        .await
-        .unwrap();
+    async fn load_policy() {
+        let adapter = NBAdapter::new("mongodb://localhost:27017", "casbin").await.unwrap();
+        let mut e = casbin::Enforcer::new("model.conf", adapter.clone()).await.unwrap();
+        assert_eq!(e.clear_policy().await.is_ok(), true);
+        assert_eq!(e.add_policy(vec!["user1", "res1", "read", "allow"].into_iter().map(str::to_owned).collect()).await.is_ok(), true);
+        assert_eq!(e.add_policy(vec!["user1", "res1", "read", "deny"].into_iter().map(str::to_owned).collect()).await.is_ok(), true);
+        let e1 = casbin::Enforcer::new("model.conf", adapter).await.unwrap();
+        assert_eq!(e1.enforce(("user1", "res1", "read")).unwrap(), true);
+        assert_eq!(e1.enforce(("user1", "res1", "write")).unwrap(), false);
     }
 
-    use thiserror::Error as ThisError;
-
-    #[derive(ThisError, Debug, Eq, PartialEq)]
-    enum MyError {
-        #[error("I hate 4")]
-        FourError,
-    }
-
-    #[test]
-    fn test_map_error() {
-        let l = [1, 2, 3, 4, 5, 6];
-        let res = l
-            .iter()
-            .map(|v| {
-                if v == &4 {
-                    return Err(MyError::FourError);
-                }
-                println!("{}", v);
-                Ok(())
+    #[tokio::test]
+    async fn load_filtered_policy() {
+        let adapter = NBAdapter::new("mongodb://localhost:27017", "casbin").await.unwrap();
+        let mut e = casbin::Enforcer::new("model.conf", adapter.clone()).await.unwrap();
+        e.clear_policy().await.unwrap();
+        assert_eq!(e.add_policy(vec!["user1", "res1", "read", "allow"].into_iter().map(str::to_owned).collect()).await.is_ok(), true);
+        assert_eq!(e.add_policy(vec!["user1", "res1", "read", "deny"].into_iter().map(str::to_owned).collect()).await.is_ok(), true);
+        assert_eq!(e.add_policy(vec!["user2", "res2", "read", "allow"].into_iter().map(str::to_owned).collect()).await.is_ok(), true);
+        assert_eq!(e.add_policy(vec!["user2", "res2", "read", "deny"].into_iter().map(str::to_owned).collect()).await.is_ok(), true);
+        assert_eq!(
+            e.load_filtered_policy(Filter {
+                p: vec!["user1", "", "", ""],
+                g: vec![],
             })
-            .collect::<std::result::Result<(), MyError>>();
-        assert_eq!(res, Err(MyError::FourError))
+            .await
+            .is_ok(),
+            true
+        );
+        assert_eq!(e.enforce(("user1", "res1", "read")).unwrap(), true);
+        assert_eq!(e.enforce(("user2", "res2", "read")).unwrap(), false);
+        assert_eq!(
+            e.load_filtered_policy(Filter {
+                p: vec!["user2", "", "", ""],
+                g: vec![],
+            })
+            .await
+            .is_ok(),
+            true
+        );
+        assert_eq!(e.enforce(("user1", "res1", "read")).unwrap(), false);
+        assert_eq!(e.enforce(("user2", "res2", "read")).unwrap(), true);
     }
 }
